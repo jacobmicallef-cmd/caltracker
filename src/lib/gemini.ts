@@ -103,7 +103,7 @@ async function describeError(res: Response): Promise<string> {
     /* response wasn't JSON */
   }
   if (res.status === 400 && /API key not valid/i.test(detail)) {
-    return 'That API key was rejected. Check it in Settings — it should start with "AIza".';
+    return 'That API key was rejected. Check for a stray space or a missing character \u2014 copy it again from aistudio.google.com.';
   }
   if (res.status === 403) {
     return 'Your API key does not have access to this model. Try "Test key" in Settings to see which models you can use.';

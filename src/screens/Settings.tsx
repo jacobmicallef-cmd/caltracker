@@ -108,7 +108,7 @@ export function SettingsScreen({ settings, onChange, onClose, onReload }: Props)
             type="password"
             value={settings.apiKey}
             onChange={(e) => set('apiKey', e.target.value.trim())}
-            placeholder="AIza…"
+            placeholder="Paste your key"
             autoComplete="off"
             spellCheck={false}
             className={inputCls}
