@@ -93,7 +93,7 @@ export async function resolveModel(apiKey: string): Promise<string> {
   return ranked[0].score > 0 ? ranked[0].id : models[0].name;
 }
 
-/** Turn an API failure into something a person can act on. */
+/** Turn an API failure into something a person can act on, keeping Google's own wording. */
 async function describeError(res: Response): Promise<string> {
   let detail = '';
   try {
@@ -112,12 +112,44 @@ async function describeError(res: Response): Promise<string> {
     return 'That model name was not found. Open Settings and pick one from the list.';
   }
   if (res.status === 429) {
-    return 'You have hit the rate limit on your Gemini key. Wait a minute and try again.';
+    return 'You have hit the rate limit on your Gemini key. Wait a minute, or pick a Lite model in Settings.';
   }
+  // Always surface what Google actually said; a bare "try again" hides real faults.
+  const suffix = detail ? ` Google said: ${detail}` : '';
   if (res.status >= 500) {
-    return 'Google’s servers returned an error. Try again in a moment.';
+    return `Google's servers returned an error (HTTP ${res.status}).${suffix}`;
   }
-  return detail || `The request failed (HTTP ${res.status}).`;
+  return detail ? `${detail} (HTTP ${res.status})` : `The request failed (HTTP ${res.status}).`;
+}
+
+/** Models vary in what they accept, so we have a rich request and a plain one. */
+function buildPayload(parts: unknown[], structured: boolean): string {
+  if (structured) {
+    return JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: RESPONSE_SCHEMA,
+        temperature: 0.3,
+      },
+    });
+  }
+  // Fallback: some models reject systemInstruction or responseSchema. Ask for JSON in words.
+  const instruction = `${SYSTEM_PROMPT}
+
+Reply with nothing but a JSON object of exactly this shape:
+{"meal_name": string, "note": string, "items": [{"name": string, "quantity": string, "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number, "confidence": "high" | "medium" | "low"}]}`;
+  return JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: instruction }, ...parts] }],
+    generationConfig: { temperature: 0.3 },
+  });
+}
+
+/** Models sometimes wrap JSON in a markdown fence even when asked not to. */
+function stripFence(text: string): string {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  return (fenced ? fenced[1] : text).trim();
 }
 
 async function callGemini(
@@ -129,21 +161,11 @@ async function callGemini(
     throw new Error('No API key set yet. Add one in Settings.');
   }
 
-  const payload = JSON.stringify({
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [{ role: 'user', parts }],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: RESPONSE_SCHEMA,
-      temperature: 0.3,
-    },
-  });
-
-  const post = (model: string) =>
+  const post = (model: string, structured: boolean) =>
     fetch(endpoint(model, settings.apiKey), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: payload,
+      body: buildPayload(parts, structured),
     });
 
   let model = settings.model;
@@ -152,14 +174,29 @@ async function callGemini(
     onModelResolved?.(model);
   }
 
-  let res = await post(model);
+  let res = await post(model, true);
 
   // A retired or renamed model gives a 404. Re-check what the key can use and retry once.
   if (res.status === 404) {
     const fresh = await resolveModel(settings.apiKey).catch(() => null);
     if (fresh && fresh !== model) {
       onModelResolved?.(fresh);
-      res = await post(fresh);
+      model = fresh;
+      res = await post(model, true);
+    }
+  }
+
+  // Structured output isn't universally supported, and an unsupported schema can
+  // come back as a 400 or a 500. Fall back to asking for JSON in the prompt.
+  if (!res.ok && res.status !== 429) {
+    const structuredError = await describeError(res);
+    const plain = await post(model, false).catch(() => null);
+    if (plain?.ok) {
+      res = plain;
+    } else {
+      throw new Error(
+        plain ? `${await describeError(plain)} (also tried without a response schema)` : structuredError,
+      );
     }
   }
 
@@ -169,13 +206,14 @@ async function callGemini(
   const text: string | undefined = body?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) {
     const reason = body?.candidates?.[0]?.finishReason;
-    if (reason === 'SAFETY') throw new Error('The model declined to analyse that image.');
-    throw new Error('The model returned an empty response. Try again.');
+    if (reason === 'SAFETY') throw new Error('The model declined to analyse that.');
+    if (reason === 'MAX_TOKENS') throw new Error('The reply was cut short. Try a simpler description.');
+    throw new Error(`The model returned an empty response${reason ? ` (${reason})` : ''}. Try again.`);
   }
 
   let parsed: { meal_name?: string; items?: FoodItem[]; note?: string };
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(stripFence(text));
   } catch {
     throw new Error('Could not read the model’s response. Try again.');
   }

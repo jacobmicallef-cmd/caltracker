@@ -1,5 +1,5 @@
 /* Offline support: serve the app shell from cache, always go to the network for Gemini. */
-const CACHE = 'cal-tracker-v1';
+const CACHE = 'cal-tracker-v2';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();
@@ -21,33 +21,42 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
-  // Never cache API traffic — it carries the key and the answers change every time.
+  // Never cache API traffic - it carries the key and the answers change every time.
   if (url.origin !== self.location.origin) return;
 
+  // The page itself goes network-first, so a new deploy shows up on the next open
+  // rather than the one after. Falls back to cache when offline.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      (async () => {
+        const cache = await caches.open(CACHE);
+        try {
+          const fresh = await fetch(request);
+          if (fresh.ok) cache.put(request, fresh.clone());
+          return fresh;
+        } catch {
+          return (await cache.match(request)) ?? (await cache.match('./index.html')) ??
+            new Response('Offline', { status: 503, statusText: 'Offline' });
+        }
+      })(),
+    );
+    return;
+  }
+
+  // Everything else is a build asset with a hashed filename, so it never changes
+  // under the same URL and is safe to serve from cache.
   event.respondWith(
     (async () => {
       const cache = await caches.open(CACHE);
       const cached = await cache.match(request);
-
-      const network = fetch(request)
-        .then((res) => {
-          if (res.ok) cache.put(request, res.clone());
-          return res;
-        })
-        .catch(() => null);
-
-      // Serve cache immediately when we have it, refreshing in the background.
       if (cached) return cached;
-
-      const res = await network;
-      if (res) return res;
-
-      // Offline and uncached: fall back to the app shell so navigation still works.
-      if (request.mode === 'navigate') {
-        const shell = await cache.match('./index.html');
-        if (shell) return shell;
+      try {
+        const res = await fetch(request);
+        if (res.ok) cache.put(request, res.clone());
+        return res;
+      } catch {
+        return new Response('Offline', { status: 503, statusText: 'Offline' });
       }
-      return new Response('Offline', { status: 503, statusText: 'Offline' });
     })(),
   );
 });
